@@ -1,0 +1,26 @@
+{
+  "name": "trackline-api",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.cjs",
+    "dev": "node --watch index.cjs",
+    "db:check": "node check-db.cjs",
+    "db:migrate": "node migrate.cjs",
+    "db:migrate:main-gate": "node migrate-main-gate.cjs",
+    "test": "node --test tests/main-gate.test.cjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.1",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.11.5",
+    "socket.io": "^4.8.4"
+  }
+}
