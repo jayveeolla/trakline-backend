@@ -1229,13 +1229,12 @@ function boardingReason(code, message) { return { code, message } }
 
 async function getBoardingState(tripId, userId = null, employeeLocation = null, db = pool) {
   const settings = await boardingSettings(db)
-  const [[trip]] = await db.query(`SELECT t.id, t.trip_code, t.status, t.trip_mode, t.route_id, t.shuttle_id, s.bus_number, s.capacity, s.latitude AS shuttle_latitude, s.longitude AS shuttle_longitude, s.speed AS shuttle_speed, s.last_gps_at, COALESCE(r.route_name, r.name) AS route_name FROM trips t JOIN shuttles s ON s.id = t.shuttle_id LEFT JOIN routes r ON r.id = t.route_id WHERE t.id = ? LIMIT 1`, [tripId])
+  const [[trip]] = await db.query(`SELECT t.id, t.trip_code, t.status, t.trip_mode, t.boarding_enabled, t.route_id, t.shuttle_id, s.bus_number, s.capacity, s.latitude AS shuttle_latitude, s.longitude AS shuttle_longitude, s.speed AS shuttle_speed, s.last_gps_at, COALESCE(r.route_name, r.name) AS route_name FROM trips t JOIN shuttles s ON s.id = t.shuttle_id LEFT JOIN routes r ON r.id = t.route_id WHERE t.id = ? LIMIT 1`, [tripId])
   if (!trip) throw Object.assign(new Error('Trip not found.'), { statusCode: 404 })
   const [[user]] = userId ? await db.query('SELECT id, name, employee_number, role, is_active FROM users WHERE id = ? LIMIT 1', [userId]) : [[null]]
   const [seatRows] = await db.query('SELECT id, shuttle_id, seat_number, row_position, column_position, seat_type, is_active FROM shuttle_seats WHERE shuttle_id = ? ORDER BY row_position, column_position, seat_number', [trip.shuttle_id])
-  await db.query('DELETE FROM trip_seat_holds WHERE trip_id = ? AND expires_at <= NOW()', [trip.id])
   const [passengerRows] = await db.query(`SELECT seat_id, seat_number, user_id, employee_name, employee_number, boarded_at, boarding_stop_id, status FROM trip_passengers WHERE trip_id = ? AND status = 'BOARDED'`, [trip.id])
-  const [holdRows] = await db.query('SELECT seat_id, user_id, expires_at FROM trip_seat_holds WHERE trip_id = ? AND expires_at > NOW()', [trip.id])
+  const [holdRows] = await db.query('SELECT seat_id, user_id, UNIX_TIMESTAMP(expires_at) * 1000 AS expires_at_ms FROM trip_seat_holds WHERE trip_id = ? AND expires_at > NOW()', [trip.id])
   const latest = (await db.query('SELECT latitude, longitude, speed, accuracy, recorded_at, source FROM shuttle_locations WHERE trip_id = ? ORDER BY recorded_at DESC, id DESC LIMIT 1', [trip.id]))[0][0] || null
   const shuttle = latest || { latitude: trip.shuttle_latitude, longitude: trip.shuttle_longitude, speed: trip.shuttle_speed, accuracy: null, recorded_at: trip.last_gps_at, source: 'SHUTTLE' }
   const latestAgeSeconds = shuttle.recorded_at ? Math.max(0, (Date.now() - new Date(shuttle.recorded_at).getTime()) / 1000) : Number.POSITIVE_INFINITY
@@ -1268,11 +1267,18 @@ async function getBoardingState(tripId, userId = null, employeeLocation = null, 
   const accuracyOk = employeeAccuracy === null || (Number.isFinite(employeeAccuracy) && employeeAccuracy <= settings.maxAccuracyMeters)
   const tripOk = ['EN_ROUTE', 'APPROACHING_STOP', 'AT_PICKUP_POINT', 'HEADING_TO_TDK'].includes(String(trip.status))
   const gpsOk = Number.isFinite(latestAgeSeconds) && latestAgeSeconds <= settings.offlineSeconds && validLatitude(Number(shuttle.latitude)) && validLongitude(Number(shuttle.longitude))
-  const stopOk = !settings.requirePickupStop || Boolean(nearestStop && nearestStop.distanceMeters <= Math.max(Number(nearestStop.geofence_radius || 100), settings.radiusMeters) && !['PASSED', 'SKIPPED'].includes(nearestStop.trip_stop_status))
   const userOk = Boolean(user?.is_active && ['USER', 'PASSENGER'].includes(String(user.role)) && user.employee_number)
+  const driverEnabled = Number(trip.boarding_enabled) === 1
+  // Driver enablement is the explicit instruction that boarding is open. It
+  // allows the employee to complete seat selection before reaching a pickup
+  // point; the driver controls when this mode is available.
+  const stopOk = driverEnabled || !settings.requirePickupStop || Boolean(nearestStop && nearestStop.distanceMeters <= Math.max(Number(nearestStop.geofence_radius || 100), settings.radiusMeters) && !['PASSED', 'SKIPPED'].includes(nearestStop.trip_stop_status))
+  const seatSelectionOpen = Boolean(driverEnabled && tripOk && userOk)
   let reason = boardingReason('NOT_READY', 'Boarding is not currently available.')
   if (userId !== null && !userOk) reason = boardingReason('EMPLOYEE_ONLY', 'Only an authenticated employee account with an employee number can board.')
   else if (!tripOk) reason = boardingReason('TRIP_NOT_ACTIVE', 'This trip is not accepting passengers.')
+  else if (!driverEnabled) reason = boardingReason('DRIVER_DISABLED', 'Employee onboarding is closed. The driver has not enabled boarding yet.')
+  else if (driverEnabled) reason = boardingReason('BOARDING_OPEN', `Employee onboarding is enabled. Select your seat on ${trip.bus_number || trip.shuttle_id}.`)
   else if (!gpsOk) reason = boardingReason('SHUTTLE_GPS_UNAVAILABLE', 'Waiting for a recent shuttle GPS location.')
   else if (!employeeValid) reason = boardingReason('EMPLOYEE_LOCATION_REQUIRED', 'Allow your phone location to check boarding eligibility.')
   else if (!accuracyOk) reason = boardingReason('EMPLOYEE_GPS_INACCURATE', 'Your GPS accuracy is too low for safe boarding.')
@@ -1280,17 +1286,18 @@ async function getBoardingState(tripId, userId = null, employeeLocation = null, 
   else if (!stopOk) reason = boardingReason('NOT_AT_PICKUP_STOP', 'Boarding opens only at an active pickup stop.')
   else if (!stationary) reason = boardingReason('SHUTTLE_NOT_STOPPED', `The shuttle must remain stopped for ${Math.ceil(settings.stoppedDurationSeconds / 60)} minutes.`)
   else reason = boardingReason('BOARDING_OPEN', `You are near ${trip.bus_number || trip.shuttle_id} and boarding is currently available.`)
+  if (driverEnabled && reason.code !== 'BOARDING_OPEN') reason = { ...reason, message: `Employee onboarding is enabled. ${reason.message}` }
   const occupiedIds = new Set(passengerRows.map((row) => Number(row.seat_id)))
   const holdMap = new Map(holdRows.map((row) => [Number(row.seat_id), row]))
   const seats = seatRows.map((seat) => {
     const hold = holdMap.get(Number(seat.id))
     const passenger = passengerRows.find((row) => Number(row.seat_id) === Number(seat.id))
-    return { ...seat, state: seat.seat_type !== 'PASSENGER' || !seat.is_active ? 'DISABLED' : passenger ? 'OCCUPIED' : hold ? (Number(hold.user_id) === Number(userId) ? 'HELD_BY_ME' : 'HELD') : 'AVAILABLE', hold_expires_at: hold?.expires_at || null, passenger_name: passenger && Number(passenger.user_id) === Number(userId) ? passenger.employee_name : null }
+    return { ...seat, state: seat.seat_type !== 'PASSENGER' || !seat.is_active ? 'DISABLED' : passenger ? 'OCCUPIED' : hold ? (Number(hold.user_id) === Number(userId) ? 'HELD_BY_ME' : 'HELD') : 'AVAILABLE', hold_expires_at: hold ? new Date(Number(hold.expires_at_ms)).toISOString() : null, passenger_name: passenger && Number(passenger.user_id) === Number(userId) ? passenger.employee_name : null }
   })
   const myPassenger = passengerRows.find((row) => Number(row.user_id) === Number(userId)) || null
   const occupied = passengerRows.length
   const passengerCapacity = seatRows.filter((seat) => seat.seat_type === 'PASSENGER' && seat.is_active).length
-  return { trip: { id: trip.id, trip_code: trip.trip_code, shuttle_id: trip.shuttle_id, bus_number: trip.bus_number, route_name: trip.route_name, status: trip.status, trip_mode: trip.trip_mode }, capacity: passengerCapacity || Number(trip.capacity || 0), occupied, available: Math.max(0, (passengerCapacity || Number(trip.capacity || 0)) - occupied), seats, passenger: myPassenger, eligibility: { open: reason.code === 'BOARDING_OPEN', code: reason.code, message: reason.message, employee_distance_meters: employeeDistance, shuttle_stopped: stationary, stopped_seconds: Math.floor(stoppedSeconds), next_stop: nearestStop?.pickup_name || null, boarding_stop_id: nearestStop?.stop_id || null, shuttle_location: { latitude: Number(shuttle.latitude), longitude: Number(shuttle.longitude), speed: Number(shuttle.speed || 0), accuracy: shuttle.accuracy === null ? null : Number(shuttle.accuracy), recorded_at: shuttle.recorded_at } }, settings: { radius_meters: settings.radiusMeters, stopped_duration_seconds: settings.stoppedDurationSeconds, max_speed_kmh: settings.maxSpeedKmh, require_pickup_stop: settings.requirePickupStop } }
+  return { trip: { id: trip.id, trip_code: trip.trip_code, shuttle_id: trip.shuttle_id, bus_number: trip.bus_number, route_name: trip.route_name, status: trip.status, trip_mode: trip.trip_mode, boarding_enabled: Number(trip.boarding_enabled) }, capacity: passengerCapacity || Number(trip.capacity || 0), occupied, available: Math.max(0, (passengerCapacity || Number(trip.capacity || 0)) - occupied), seats, passenger: myPassenger, eligibility: { open: reason.code === 'BOARDING_OPEN', seat_selection_open: seatSelectionOpen, code: reason.code, message: reason.message, employee_distance_meters: employeeDistance, shuttle_stopped: stationary, stopped_seconds: Math.floor(stoppedSeconds), next_stop: nearestStop?.pickup_name || null, boarding_stop_id: nearestStop?.stop_id || null, driver_enabled: driverEnabled, shuttle_location: { latitude: Number(shuttle.latitude), longitude: Number(shuttle.longitude), speed: Number(shuttle.speed || 0), accuracy: shuttle.accuracy === null ? null : Number(shuttle.accuracy), recorded_at: shuttle.recorded_at } }, settings: { radius_meters: settings.radiusMeters, stopped_duration_seconds: settings.stoppedDurationSeconds, max_speed_kmh: settings.maxSpeedKmh, require_pickup_stop: settings.requirePickupStop } }
 }
 
 function employeeLocationFromBody(body) {
@@ -1674,12 +1681,30 @@ app.post('/api/trips/:id/seat-holds', requireAuth, requireRole('USER'), async (r
   try {
     await connection.beginTransaction()
     const state = await getBoardingState(tripId, req.user.id, location, connection)
-    if (!state.eligibility.open) throw Object.assign(new Error(state.eligibility.message), { statusCode: 403 })
-    const seat = state.seats.find((item) => Number(item.id) === seatId)
-    if (!seat || seat.state === 'DISABLED') throw Object.assign(new Error('This seat is unavailable.'), { statusCode: 409 })
-    if (seat.state === 'OCCUPIED' || (seat.state === 'HELD' && seat.state !== 'HELD_BY_ME')) throw Object.assign(new Error(`Seat ${seat.seat_number} has just been occupied. Please choose another seat.`), { statusCode: 409 })
-    const expiresAt = new Date(Date.now() + state.settings.holdSeconds * 1000)
-    await connection.query('INSERT INTO trip_seat_holds (trip_id, seat_id, user_id, expires_at) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), expires_at = VALUES(expires_at)', [tripId, seatId, req.user.id, mysqlDateTime(expiresAt)])
+    if (!state.eligibility.seat_selection_open) throw Object.assign(new Error(state.eligibility.message), { statusCode: 403 })
+    // Lock the physical seat row before checking occupancy/holds. Both seat
+    // holds and boarding use this lock, so two users cannot reserve the same
+    // seat between the availability check and the INSERT.
+    const [[seat]] = await connection.query("SELECT id, seat_number, seat_type, is_active FROM shuttle_seats WHERE id = ? AND shuttle_id = ? FOR UPDATE", [seatId, state.trip.shuttle_id])
+    if (!seat || seat.seat_type !== 'PASSENGER' || !seat.is_active) throw Object.assign(new Error('This seat is unavailable.'), { statusCode: 409 })
+    const [[occupiedSeat]] = await connection.query("SELECT id FROM trip_passengers WHERE trip_id = ? AND seat_id = ? AND status = 'BOARDED' LIMIT 1", [tripId, seatId])
+    if (occupiedSeat) throw Object.assign(new Error(`Seat ${seat.seat_number} has just been occupied. Please choose another seat.`), { statusCode: 409 })
+    // Early seat selection needs more than the short hold used during normal
+    // boarding. The actual /board endpoint still enforces GPS eligibility.
+    // A selected seat is reserved for two minutes while the employee fills
+    // in the signature/details. Expired holds are released by the background
+    // cleanup task and are also rejected by the booking transaction below.
+    const holdSeconds = 2 * 60
+    const expiresAt = new Date(Date.now() + holdSeconds * 1000)
+    const [[existingHold]] = await connection.query('SELECT user_id, expires_at FROM trip_seat_holds WHERE trip_id = ? AND seat_id = ? FOR UPDATE', [tripId, seatId])
+    if (existingHold && new Date(existingHold.expires_at).getTime() > Date.now() && Number(existingHold.user_id) !== Number(req.user.id)) {
+      throw Object.assign(new Error(`Seat ${seat.seat_number} is temporarily held by another employee.`), { statusCode: 409 })
+    }
+    if (existingHold) {
+      await connection.query('UPDATE trip_seat_holds SET user_id = ?, expires_at = DATE_ADD(NOW(), INTERVAL 2 MINUTE) WHERE trip_id = ? AND seat_id = ?', [req.user.id, tripId, seatId])
+    } else {
+      await connection.query('INSERT INTO trip_seat_holds (trip_id, seat_id, user_id, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 2 MINUTE))', [tripId, seatId, req.user.id])
+    }
     await connection.commit()
     const event = { tripId, seatId, seatNumber: seat.seat_number, userId: req.user.id, expiresAt: expiresAt.toISOString() }
     io.to(`trip:${tripId}`).emit('trip_seat_held', event)
@@ -1719,6 +1744,7 @@ app.post('/api/trips/:id/board', requireAuth, requireRole('USER'), async (req, r
     if (existingPassenger) throw Object.assign(new Error(`You have already boarded this trip on seat ${existingPassenger.seat_number}.`), { statusCode: 409 })
     const [[otherHold]] = await connection.query('SELECT user_id FROM trip_seat_holds WHERE trip_id = ? AND seat_id = ? AND expires_at > NOW() FOR UPDATE', [tripId, seatId])
     if (otherHold && Number(otherHold.user_id) !== Number(user.id)) throw Object.assign(new Error(`Seat ${seat.seat_number} is temporarily held by another employee.`), { statusCode: 409 })
+    if (!otherHold || Number(otherHold.user_id) !== Number(user.id)) throw Object.assign(new Error(`Seat ${seat.seat_number} reservation expired. Please select it again.`), { statusCode: 409 })
     const [[stop]] = state.eligibility.boarding_stop_id ? await connection.query(`SELECT st.id, COALESCE(pp.pickup_name, st.name) AS pickup_name FROM stops st LEFT JOIN route_stops rs ON rs.route_id = ? AND rs.stop_id = st.id LEFT JOIN pickup_points pp ON pp.id = rs.pickup_point_id WHERE st.id = ?`, [state.trip.route_id, state.eligibility.boarding_stop_id]) : [[null]]
     const shuttleLocation = state.eligibility.shuttle_location
     await connection.query(`INSERT INTO trip_passengers (trip_id, shuttle_id, seat_id, seat_number, user_id, employee_number, employee_name, boarded_at, boarded_latitude, boarded_longitude, employee_boarding_latitude, employee_boarding_longitude, shuttle_boarding_latitude, shuttle_boarding_longitude, boarding_stop_id, boarding_stop_name_snapshot, signature_data, status) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BOARDED')`, [tripId, state.trip.shuttle_id, seat.id, seat.seat_number, user.id, user.employee_number, user.name, location.latitude, location.longitude, location.latitude, location.longitude, shuttleLocation.latitude, shuttleLocation.longitude, stop?.id || null, stop?.pickup_name || null, signature])
@@ -1806,9 +1832,10 @@ app.get('/api/trips/:id/passengers', requireAuth, async (req, res) => {
     const admin = role === 'ADMIN'
     const includeHidden = admin && ['1', 'true', 'yes'].includes(String(req.query.includeHidden || '').toLowerCase())
     const testMode = role === 'USER' && ['1', 'true', 'yes'].includes(String(req.query.testMode || '').toLowerCase())
-    const userScope = role === 'USER' ? (testMode ? 'tp.is_test = 1' : 'tp.user_id = ?') : '1 = 1'
-    const [rows] = await pool.query(`SELECT tp.id, tp.trip_id, tp.shuttle_id, tp.seat_id, tp.seat_number, tp.user_id, tp.employee_number, tp.employee_name, tp.boarded_at, tp.boarded_latitude, tp.boarded_longitude, tp.employee_boarding_latitude, tp.employee_boarding_longitude, tp.shuttle_boarding_latitude, tp.shuttle_boarding_longitude, tp.boarding_stop_id, tp.status, tp.is_test, COALESCE(pp.pickup_name, st.name) AS boarding_stop_name, ${admin ? 'tp.signature_data' : 'NULL AS signature_data'} FROM trip_passengers tp LEFT JOIN pickup_points pp ON pp.id = (SELECT rs.pickup_point_id FROM route_stops rs WHERE rs.route_id = ? AND rs.stop_id = tp.boarding_stop_id LIMIT 1) LEFT JOIN stops st ON st.id = tp.boarding_stop_id WHERE tp.trip_id = ? AND ${includeHidden ? '1 = 1' : "tp.status = 'BOARDED'"} AND (${userScope}) ORDER BY CAST(tp.seat_number AS UNSIGNED), tp.id`, [trip.route_id, req.params.id, ...(role === 'USER' && !testMode ? [req.user.id] : [])])
-    res.json({ passengers: rows, can_view_signatures: admin, test_mode: testMode })
+    const manifestMode = role === 'USER' && ['1', 'true', 'yes'].includes(String(req.query.manifest || '').toLowerCase())
+    const userScope = role === 'USER' ? (manifestMode ? '1 = 1' : testMode ? 'tp.is_test = 1' : 'tp.user_id = ?') : '1 = 1'
+    const [rows] = await pool.query(`SELECT tp.id, tp.trip_id, tp.shuttle_id, tp.seat_id, tp.seat_number, tp.user_id, tp.employee_number, tp.employee_name, tp.boarded_at, tp.boarded_latitude, tp.boarded_longitude, tp.employee_boarding_latitude, tp.employee_boarding_longitude, tp.shuttle_boarding_latitude, tp.shuttle_boarding_longitude, tp.boarding_stop_id, tp.status, tp.is_test, COALESCE(pp.pickup_name, st.name) AS boarding_stop_name, ${admin ? 'tp.signature_data' : 'NULL AS signature_data'} FROM trip_passengers tp LEFT JOIN pickup_points pp ON pp.id = (SELECT rs.pickup_point_id FROM route_stops rs WHERE rs.route_id = ? AND rs.stop_id = tp.boarding_stop_id LIMIT 1) LEFT JOIN stops st ON st.id = tp.boarding_stop_id WHERE tp.trip_id = ? AND ${includeHidden ? '1 = 1' : "tp.status = 'BOARDED'"} AND (${userScope}) ORDER BY CAST(tp.seat_number AS UNSIGNED), tp.id`, [trip.route_id, req.params.id, ...(role === 'USER' && !testMode && !manifestMode ? [req.user.id] : [])])
+    res.json({ passengers: rows, can_view_signatures: admin, test_mode: testMode, manifest_mode: manifestMode })
   } catch (error) { res.status(error.statusCode || 500).json({ message: error.message }) }
 })
 
@@ -2043,6 +2070,11 @@ app.get('/api/trips/:id/stop-status', requireAuth, async (req, res) => {
 app.post('/api/trips/start', requireAuth, requireRole('ADMIN', 'DRIVER'), async (req, res) => {
   const shuttleId = String(req.body?.shuttleId || req.body?.shuttle_id || '').trim().toUpperCase()
   if (!shuttleId) return res.status(400).json({ message: 'Shuttle is required.' })
+  const startLatitude = numberOrNull(req.body?.startLatitude ?? req.body?.start_latitude)
+  const startLongitude = numberOrNull(req.body?.startLongitude ?? req.body?.start_longitude)
+  const startAccuracy = numberOrNull(req.body?.startAccuracy ?? req.body?.start_accuracy)
+  const hasStartLocation = validLatitude(startLatitude) && validLongitude(startLongitude)
+  if (normalizedRole(req.user?.role) === 'DRIVER' && !hasStartLocation) return res.status(400).json({ message: 'Allow phone GPS before starting the trip so the route can begin from your current location.' })
   const connection = await pool.getConnection()
   try {
     await connection.beginTransaction()
@@ -2069,11 +2101,12 @@ app.post('/api/trips/start', requireAuth, requireRole('ADMIN', 'DRIVER'), async 
     const [[dateCode]] = await connection.query(`SELECT DATE_FORMAT(CURRENT_DATE, '%Y%m%d') AS value`)
     const tripCode = `TRP-${dateCode.value}-${String(sequence.next_number).padStart(3, '0')}`
     const [[driverSnapshot]] = driverId ? await connection.query('SELECT driver_name FROM drivers WHERE id = ?', [driverId]) : [[null]]
-    const [result] = await connection.query(`INSERT INTO trips (trip_code, shuttle_id, route_id, driver_id, schedule_id, trip_date, started_at, status, gps_state, shuttle_code_snapshot, route_name_snapshot, destination_name_snapshot, driver_name_snapshot, capacity_snapshot) VALUES (?, ?, ?, ?, ?, CURRENT_DATE, NOW(), 'EN_ROUTE', 'OFFLINE', ?, ?, ?, ?, ?)`, [tripCode, shuttleId, routeId, driverId, scheduleId, shuttle.bus_number || shuttle.id, route.route_name || route.name, route.destination_name, driverSnapshot?.driver_name || null, shuttle.capacity])
+    const [result] = await connection.query(`INSERT INTO trips (trip_code, shuttle_id, route_id, driver_id, schedule_id, trip_date, started_at, status, gps_state, boarding_enabled, shuttle_code_snapshot, route_name_snapshot, destination_name_snapshot, driver_name_snapshot, capacity_snapshot) VALUES (?, ?, ?, ?, ?, CURRENT_DATE, NOW(), 'EN_ROUTE', 'OFFLINE', 0, ?, ?, ?, ?, ?)`, [tripCode, shuttleId, routeId, driverId, scheduleId, shuttle.bus_number || shuttle.id, route.route_name || route.name, route.destination_name, driverSnapshot?.driver_name || null, shuttle.capacity])
     const [routeStops] = await connection.query('SELECT stop_id FROM route_stops WHERE route_id = ? AND is_active = 1 ORDER BY stop_order', [routeId])
     for (const stop of routeStops) await connection.query('INSERT IGNORE INTO trip_stop_status (trip_id, route_id, stop_id, status) VALUES (?, ?, ?, \'UPCOMING\')', [result.insertId, routeId, stop.stop_id])
     await connection.query(`UPDATE shuttles SET route_id = ?, status = 'LIVE' WHERE id = ?`, [routeId, shuttleId])
     await connection.commit()
+    if (hasStartLocation) await processLocationUpdate({ shuttleId, tripId: result.insertId, latitude: startLatitude, longitude: startLongitude, speed: 0, heading: 0, accuracy: startAccuracy, clientId: `START-${result.insertId}`, source: 'PHONE_GPS' })
     const [[trip]] = await pool.query('SELECT * FROM trips WHERE id = ?', [result.insertId])
     await writeAudit(req.user.id, 'START_TRIP', 'TRIP', trip.id, { tripCode: trip.trip_code, shuttleId })
     io.to('standard-users').emit('trip:started', trip)
@@ -2084,6 +2117,25 @@ app.post('/api/trips/start', requireAuth, requireRole('ADMIN', 'DRIVER'), async 
     await connection.rollback()
     res.status(error.statusCode || (error.code === 'ER_DUP_ENTRY' ? 409 : 500)).json({ message: error.message })
   } finally { connection.release() }
+})
+
+app.post('/api/trips/:id/boarding/toggle', requireAuth, requireRole('ADMIN', 'DRIVER'), async (req, res) => {
+  const tripId = Number(req.params.id)
+  const enabled = req.body?.enabled === true || ['1', 'true', 'yes', 'on'].includes(String(req.body?.enabled || '').toLowerCase())
+  try {
+    const driverId = await authenticatedDriverId(req)
+    const [[trip]] = await pool.query(`SELECT id, trip_code, shuttle_id, driver_id, status, boarding_enabled FROM trips WHERE id = ? AND status IN ('NOT_STARTED', 'EN_ROUTE', 'APPROACHING_STOP', 'AT_PICKUP_POINT', 'HEADING_TO_TDK', 'PAUSED')`, [tripId])
+    if (!trip) return res.status(404).json({ message: 'Active trip not found.' })
+    if (normalizedRole(req.user?.role) === 'DRIVER' && Number(trip.driver_id) !== Number(driverId)) return res.status(403).json({ message: 'You can only control onboarding for your own trip.' })
+    await pool.query('UPDATE trips SET boarding_enabled = ? WHERE id = ?', [enabled ? 1 : 0, tripId])
+    const [[updatedTrip]] = await pool.query('SELECT * FROM trips WHERE id = ?', [tripId])
+    const event = { tripId, enabled }
+    io.to(`trip:${tripId}`).emit('boarding_state_updated', event)
+    io.to('standard-users').emit('boarding_control_updated', event)
+    await writeAudit(req.user.id, enabled ? 'ENABLE_EMPLOYEE_BOARDING' : 'DISABLE_EMPLOYEE_BOARDING', 'TRIP', tripId)
+    await createSystemTripMessage(tripId, enabled ? 'BOARDING_ENABLED' : 'BOARDING_DISABLED', `${trip.shuttle_id} employee onboarding ${enabled ? 'enabled' : 'disabled'} by the driver.`, { severity: enabled ? 'INFO' : 'WARNING', senderUserId: req.user.id, senderRole: normalizedRole(req.user?.role) })
+    res.json({ trip: updatedTrip, enabled })
+  } catch (error) { res.status(error.statusCode || 500).json({ message: error.message }) }
 })
 
 async function changeTripGpsState(req, res, nextState) {
@@ -2294,6 +2346,17 @@ app.put('/api/settings/:key', requireAuth, requireAdmin, async (req, res) => {
   } catch (error) { res.status(500).json({ message: error.message }) }
 })
 
+async function releaseExpiredSeatHolds() {
+  try {
+    const [expired] = await pool.query('SELECT trip_id, seat_id FROM trip_seat_holds WHERE expires_at <= NOW()')
+    if (!expired.length) return
+    await pool.query('DELETE FROM trip_seat_holds WHERE expires_at <= NOW()')
+    for (const hold of expired) io.to(`trip:${Number(hold.trip_id)}`).emit('trip_seat_hold_released', { tripId: Number(hold.trip_id), seatId: Number(hold.seat_id), expired: true })
+  } catch { /* cleanup retries on the next interval */ }
+}
+
 registerMainGateRoutes({ app, pool, io, requireAuth, requireRole, writeAudit })
 
+const seatHoldExpiryTimer = setInterval(() => { void releaseExpiredSeatHolds() }, 5000)
+seatHoldExpiryTimer.unref?.()
 httpServer.listen(port, () => console.log(`Trackline API listening on http://localhost:${port}`))

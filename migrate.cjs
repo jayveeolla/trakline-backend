@@ -260,6 +260,7 @@ async function migrate() {
   await addColumn(db, 'trips', 'ended_by', 'INT UNSIGNED NULL')
   await addColumn(db, 'trips', 'gps_state', 'VARCHAR(20) NOT NULL DEFAULT \'OFFLINE\'')
   await addColumn(db, 'trips', 'trip_mode', 'VARCHAR(16) NOT NULL DEFAULT \'REAL\'')
+  await addColumn(db, 'trips', 'boarding_enabled', 'TINYINT(1) NOT NULL DEFAULT 0')
   await addColumn(db, 'trips', 'tdk_confirmation_count', 'INT UNSIGNED NOT NULL DEFAULT 0')
   await addColumn(db, 'trips', 'created_at', 'TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP')
   await addColumn(db, 'trips', 'updated_at', 'TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP')
@@ -460,7 +461,8 @@ async function migrate() {
       CONSTRAINT fk_trip_passengers_stop FOREIGN KEY (boarding_stop_id) REFERENCES stops(id) ON DELETE SET NULL,
       KEY idx_trip_passengers_trip_status (trip_id, status),
       KEY idx_trip_passengers_user_trip (user_id, trip_id),
-      KEY idx_trip_passengers_trip_seat (trip_id, seat_id)
+      KEY idx_trip_passengers_trip_seat (trip_id, seat_id),
+      UNIQUE KEY uq_trip_passengers_trip_seat_status (trip_id, seat_id, status)
     ) ENGINE=InnoDB
   `)
   await db.query(`
@@ -481,6 +483,10 @@ async function migrate() {
   `)
   await addColumn(db, 'trip_passengers', 'is_test', 'TINYINT(1) NOT NULL DEFAULT 0')
   await addColumn(db, 'trip_passengers', 'boarding_stop_name_snapshot', 'VARCHAR(120) NULL')
+  // Prevent two records with the same active status from using one seat on
+  // one trip. Cancelled/removed/no-show records can still coexist with a
+  // later active booking of that same seat.
+  await addIndex(db, 'trip_passengers', 'uq_trip_passengers_trip_seat_status', 'UNIQUE KEY uq_trip_passengers_trip_seat_status (trip_id, seat_id, status)')
   await db.query(`
     CREATE TABLE IF NOT EXISTS main_gate_verifications (
       trip_passenger_id BIGINT UNSIGNED PRIMARY KEY,
@@ -600,7 +606,7 @@ async function migrate() {
     ['BOARDING_STATIONARY_RADIUS_METERS', '20'],
     ['BOARDING_MAX_GPS_ACCURACY_METERS', '100'],
     ['REQUIRE_PICKUP_STOP_FOR_BOARDING', 'true'],
-    ['SEAT_HOLD_SECONDS', '60'],
+    ['SEAT_HOLD_SECONDS', '120'],
   ]
   for (const setting of tdkSettings) {
     await db.query('INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)', setting)
